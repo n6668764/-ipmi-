@@ -1,0 +1,312 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import subprocess
+import re
+import configparser
+import os
+import logging
+import threading
+from datetime import datetime
+from queue import Queue
+
+# 配置日志系统
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='ipmi_monitor.log',
+    filemode='w'
+)
+
+
+class IPMIMonitorGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("IPMI硬件监控工具 v3.0 by hmr")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # 初始化参数
+        self.data_queue = Queue()
+        self.update_interval = 5000  # 5秒更新间隔
+        self.running = True
+        self.ipmitool_path = tk.StringVar()
+        self.bmc_ip = tk.StringVar(value="192.168.8.181")
+        self.bmc_user = tk.StringVar(value="albert")
+        self.bmc_pass = tk.StringVar(value="admin")
+
+        # 初始化界面
+        self.create_widgets()
+        self.load_config()
+        self.start_update_cycle()
+
+    def create_widgets(self):
+        """创建界面组件"""
+        # 顶部工具栏
+        tool_frame = ttk.Frame(self.root)
+        tool_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        # 工具路径组件
+        ttk.Label(tool_frame, text="工具路径:").grid(row=0, column=0, padx=2)
+        ttk.Entry(tool_frame, textvariable=self.ipmitool_path, width=30).grid(row=0, column=1, padx=2)
+        ttk.Button(tool_frame, text="浏览", command=self.browse_ipmitool).grid(row=0, column=2, padx=2)
+
+        # 连接参数组件
+        ttk.Label(tool_frame, text="BMC IP:").grid(row=1, column=0, padx=2)
+        ttk.Entry(tool_frame, textvariable=self.bmc_ip, width=15).grid(row=1, column=1, padx=2)
+        ttk.Label(tool_frame, text="用户名:").grid(row=1, column=2, padx=2)
+        ttk.Entry(tool_frame, textvariable=self.bmc_user, width=10).grid(row=1, column=3, padx=2)
+        ttk.Label(tool_frame, text="密码:").grid(row=1, column=4, padx=2)
+        ttk.Entry(tool_frame, textvariable=self.bmc_pass, show="*", width=10).grid(row=1, column=5, padx=2)
+        ttk.Button(tool_frame, text="测试连接", command=self.test_connection).grid(row=1, column=6, padx=5)
+
+        # 主内容区
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        # 左侧传感器面板
+        sensor_frame = ttk.LabelFrame(main_frame, text="传感器数据")
+        sensor_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # 温度监控分组
+        temp_group = ttk.LabelFrame(sensor_frame, text="温度监控")
+        temp_group.pack(fill=tk.X, padx=5, pady=2)
+
+        self.temp_labels = {
+            'CPU1_Temp': ttk.Label(temp_group, text="CPU1温度: --"),
+            'CPU2_Temp': ttk.Label(temp_group, text="CPU2温度: --"),
+            'PCH_Temp': ttk.Label(temp_group, text="主板温度: --")
+        }
+        for label in self.temp_labels.values():
+            label.pack(anchor=tk.W, padx=5, pady=2)
+
+        # 电源功率分组
+        psu_group = ttk.LabelFrame(sensor_frame, text="电源监控")
+        psu_group.pack(fill=tk.X, padx=5, pady=2)
+
+        self.psu_labels = {
+            'PSU1_POUT': ttk.Label(psu_group, text="电源1功率: --"),
+            'PSU2_POUT': ttk.Label(psu_group, text="电源2功率: --")
+        }
+        for label in self.psu_labels.values():
+            label.pack(anchor=tk.W, padx=5, pady=2)
+
+        # 电压监控分组
+        voltage_group = ttk.LabelFrame(sensor_frame, text="电压监控")
+        voltage_group.pack(fill=tk.X, padx=5, pady=2)
+
+        self.voltage_labels = {
+            'P3V3': ttk.Label(voltage_group, text="3.3V电压: --"),
+            'P5V': ttk.Label(voltage_group, text="5V电压: --"),
+            'P12V': ttk.Label(voltage_group, text="12V电压: --"),
+            'Vbat': ttk.Label(voltage_group, text="电池电压: --"),
+            'CPU1_VCCIN': ttk.Label(voltage_group, text="CPU1输入电压: --"),
+            'CPU2_VCCIN': ttk.Label(voltage_group, text="CPU2输入电压: --")
+        }
+        for label in self.voltage_labels.values():
+            label.pack(anchor=tk.W, padx=5, pady=2)
+
+        # 风扇转速面板
+        fan_group = ttk.LabelFrame(sensor_frame, text="风扇转速 (RPM)")
+        fan_group.pack(fill=tk.X, padx=5, pady=5)
+        self.fan_labels = {}
+        for i in range(1, 8):
+            self.fan_labels[f'FAN{i}'] = ttk.Label(fan_group, text=f"风扇 {i}: --")
+            self.fan_labels[f'FAN{i}'].grid(row=(i - 1) // 4, column=(i - 1) % 4, padx=5, pady=2, sticky=tk.W)
+
+        # 右侧控制面板
+        control_frame = ttk.LabelFrame(main_frame, text="风扇控制")
+        control_frame.pack(side=tk.RIGHT, fill=tk.Y)
+        ttk.Label(control_frame, text="风扇编号 (1-7):").pack(pady=2)
+        self.fan_id_entry = ttk.Entry(control_frame, width=5)
+        self.fan_id_entry.pack()
+        ttk.Label(control_frame, text="转速 (十六进制):").pack(pady=2)
+        self.speed_entry = ttk.Entry(control_frame, width=8)
+        self.speed_entry.pack()
+        ttk.Button(control_frame, text="设置转速", command=self.set_fan).pack(pady=10)
+
+        # 状态栏
+        self.status_var = tk.StringVar(value="就绪")
+        status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN)
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def start_update_cycle(self):
+        """启动数据更新线程"""
+        self.update_thread = threading.Thread(target=self.update_worker, daemon=True)
+        self.update_thread.start()
+        self.root.after(100, self.process_queue)
+
+    def update_worker(self):
+        """后台数据获取线程"""
+        while self.running:
+            try:
+                output = self.run_ipmitool(['sensor', 'list'])
+                sensors = self.parse_sensor_data(output)
+                self.data_queue.put(sensors)
+                self.status_var.set(f"最后更新: {datetime.now().strftime('%H:%M:%S')}")
+            except Exception as e:
+                self.data_queue.put(e)
+            finally:
+                threading.Event().wait(self.update_interval / 1000)
+
+    def process_queue(self):
+        """处理数据队列（主线程）"""
+        try:
+            while not self.data_queue.empty():
+                item = self.data_queue.get_nowait()
+                if isinstance(item, Exception):
+                    self.status_var.set(f"错误: {str(item)}")
+                    logging.error(str(item))
+                else:
+                    self.update_ui(item)
+        finally:
+            if self.running:
+                self.root.after(100, self.process_queue)
+
+    def update_ui(self, sensors):
+        """更新界面数据"""
+        # 更新温度
+        for name, label in self.temp_labels.items():
+            value = sensors.get(name, 'N/A')
+            label.config(
+                text=f"{label.cget('text').split(':')[0]}: {value}℃" if value != 'N/A' else f"{label.cget('text').split(':')[0]}: --")
+
+        # 更新电源功率
+        for name, label in self.psu_labels.items():
+            value = sensors.get(name, 'N/A')
+            label.config(
+                text=f"{label.cget('text').split(':')[0]}: {value}W" if value != 'N/A' else f"{label.cget('text').split(':')[0]}: --")
+
+        # 更新电压
+        for name, label in self.voltage_labels.items():
+            value = sensors.get(name, 'N/A')
+            formatted_value = f"{float(value):.3f} V" if value != 'N/A' else '--'
+            label.config(text=f"{label.cget('text').split(':')[0]}: {formatted_value}")
+
+        # 更新风扇转速
+        for i in range(1, 8):
+            fan_key = f'FAN{i}_R_Speed'
+            value = sensors.get(fan_key, 'N/A')
+            self.fan_labels[f'FAN{i}'].config(text=f"风扇 {i}: {value} RPM" if value != 'N/A' else f"风扇 {i}: --")
+
+    def browse_ipmitool(self):
+        """选择ipmitool路径"""
+        path = filedialog.askopenfilename(
+            title="选择ipmitool可执行文件",
+            filetypes=[("可执行文件", "*.exe"), ("所有文件", "*.*")]
+        )
+        if path:
+            self.ipmitool_path.set(path)
+            self.save_config()
+
+    def load_config(self):
+        """加载配置文件"""
+        config = configparser.ConfigParser()
+        if os.path.exists('config.ini'):
+            try:
+                config.read('config.ini')
+                self.ipmitool_path.set(config.get('DEFAULT', 'ipmitool_path', fallback=""))
+                self.bmc_ip.set(config.get('DEFAULT', 'ip', fallback=self.bmc_ip.get()))
+                self.bmc_user.set(config.get('DEFAULT', 'user', fallback=self.bmc_user.get()))
+                self.bmc_pass.set(config.get('DEFAULT', 'password', fallback=self.bmc_pass.get()))
+            except Exception as e:
+                logging.error(f"配置加载失败: {str(e)}")
+
+    def save_config(self):
+        """保存配置文件"""
+        config = configparser.ConfigParser()
+        config['DEFAULT'] = {
+            'ipmitool_path': self.ipmitool_path.get(),
+            'ip': self.bmc_ip.get(),
+            'user': self.bmc_user.get(),
+            'password': self.bmc_pass.get()
+        }
+        with open('config.ini', 'w') as f:
+            config.write(f)
+
+    def on_close(self):
+        """窗口关闭事件"""
+        self.running = False
+        if hasattr(self, 'update_thread') and self.update_thread.is_alive():
+            self.update_thread.join(timeout=1)
+        self.save_config()
+        self.root.destroy()
+
+    def test_connection(self):
+        """测试BMC连接"""
+        try:
+            output = self.run_ipmitool(['sensor', 'list'])
+            messagebox.showinfo("连接成功", "BMC连接验证通过！")
+        except Exception as e:
+            messagebox.showerror("连接失败", f"错误信息:\n{str(e)}")
+
+    def run_ipmitool(self, command):
+        """执行IPMI命令"""
+        if not os.path.exists(self.ipmitool_path.get()):
+            raise FileNotFoundError(f"找不到ipmitool: {self.ipmitool_path.get()}")
+
+        cmd = [
+                  self.ipmitool_path.get(),
+                  '-I', 'lanplus',
+                  '-H', self.bmc_ip.get(),
+                  '-U', self.bmc_user.get(),
+                  '-P', self.bmc_pass.get()
+              ] + command
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=15
+        )
+        return result.stdout
+
+    def parse_sensor_data(self, output):
+        """解析传感器数据"""
+        sensors = {}
+        for line in output.splitlines():
+            if not line.strip() or '|' not in line:
+                continue
+            parts = [p.strip() for p in line.split('|')]
+            if len(parts) >= 4:
+                sensor_name = parts[0].replace(" ", "_")
+                sensor_value = parts[1]
+
+                # 过滤无效值
+                if sensor_value.lower() in ['na', 'disabled', '']:
+                    continue
+
+                # 数值格式化处理
+                try:
+                    float(sensor_value)  # 验证是否为数值
+                    sensors[sensor_name] = sensor_value
+                except ValueError:
+                    pass
+        return sensors
+
+    def set_fan(self):
+        """设置风扇转速"""
+        try:
+            fan_id = self.fan_id_entry.get().strip()
+            speed = self.speed_entry.get().strip()
+
+            # 输入验证
+            if not fan_id.isdigit() or int(fan_id) not in range(1, 8):
+                raise ValueError("风扇编号必须为1-7的数字")
+            if not re.match(r'^0x[0-9a-fA-F]{1,2}$', speed):
+                raise ValueError("转速格式应为十六进制 (例如0x10)")
+
+            # 执行命令
+            self.run_ipmitool(['raw', '0x2e', '0x30', '00', f'0{fan_id}', speed])
+            messagebox.showinfo("成功", "转速设置指令已发送")
+        except Exception as e:
+            messagebox.showerror("错误", f"设置失败:\n{str(e)}")
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    try:
+        app = IPMIMonitorGUI(root)
+        root.mainloop()
+    except Exception as e:
+        logging.critical(f"程序崩溃: {str(e)}")
+        messagebox.showerror("致命错误", f"程序异常终止:\n{str(e)}")
