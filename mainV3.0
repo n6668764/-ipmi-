@@ -21,7 +21,7 @@ logging.basicConfig(
 class IPMIMonitorGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("IPMI硬件监控工具 v3.0 by hmr")
+        self.root.title("IPMI硬件监控工具 v3.1")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # 初始化参数
@@ -32,11 +32,13 @@ class IPMIMonitorGUI:
         self.bmc_ip = tk.StringVar(value="192.168.8.181")
         self.bmc_user = tk.StringVar(value="albert")
         self.bmc_pass = tk.StringVar(value="admin")
+        self.fan_percent_vars = {i: tk.IntVar(value=50) for i in range(1, 8)}
 
         # 初始化界面
         self.create_widgets()
         self.load_config()
         self.start_update_cycle()
+        self.root.after(100, self.auto_apply_custom_mode)  # 添加自动应用功能
 
     def create_widgets(self):
         """创建界面组件"""
@@ -114,19 +116,94 @@ class IPMIMonitorGUI:
 
         # 右侧控制面板
         control_frame = ttk.LabelFrame(main_frame, text="风扇控制")
-        control_frame.pack(side=tk.RIGHT, fill=tk.Y)
-        ttk.Label(control_frame, text="风扇编号 (1-7):").pack(pady=2)
-        self.fan_id_entry = ttk.Entry(control_frame, width=5)
-        self.fan_id_entry.pack()
-        ttk.Label(control_frame, text="转速 (十六进制):").pack(pady=2)
-        self.speed_entry = ttk.Entry(control_frame, width=8)
-        self.speed_entry.pack()
-        ttk.Button(control_frame, text="设置转速", command=self.set_fan).pack(pady=10)
+        control_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5)
+
+        # 模式选择
+        self.mode_var = tk.StringVar()
+        modes = ["静音模式", "性能模式", "自定义模式"]
+        mode_combobox = ttk.Combobox(control_frame, textvariable=self.mode_var, values=modes, state="readonly")
+        mode_combobox.pack(pady=5)
+        mode_combobox.bind("<<ComboboxSelected>>", self.on_mode_selected)
+        self.mode_var.set("静音模式")
+
+        # 创建不同模式的Frame
+        self.quiet_mode_frame = ttk.Frame(control_frame)
+        self.performance_mode_frame = ttk.Frame(control_frame)
+        self.custom_mode_frame = ttk.Frame(control_frame)
+
+        # 静音模式内容
+        ttk.Label(self.quiet_mode_frame, text="设置所有风扇为静音转速（30%）").pack(pady=5)
+        ttk.Button(self.quiet_mode_frame, text="应用静音模式", command=lambda: self.apply_preset_mode(30)).pack(pady=5)
+
+        # 性能模式内容
+        ttk.Label(self.performance_mode_frame, text="设置所有风扇为高性能转速（80%）").pack(pady=5)
+        ttk.Button(self.performance_mode_frame, text="应用性能模式", command=lambda: self.apply_preset_mode(80)).pack(
+            pady=5)
+
+        # 自定义模式内容
+        for fan_id in range(1, 8):
+            frame = ttk.Frame(self.custom_mode_frame)
+            frame.pack(fill=tk.X, padx=5, pady=2)
+            ttk.Label(frame, text=f"风扇 {fan_id}:").pack(side=tk.LEFT)
+            spinbox = ttk.Spinbox(frame, from_=0, to=100, textvariable=self.fan_percent_vars[fan_id], width=5)
+            spinbox.pack(side=tk.LEFT, padx=5)
+            ttk.Button(frame, text="设置", command=lambda fid=fan_id: self.set_single_fan(fid)).pack(side=tk.LEFT)
+
+        # 初始显示静音模式
+        self.quiet_mode_frame.pack(fill=tk.X, padx=5, pady=5)
 
         # 状态栏
         self.status_var = tk.StringVar(value="就绪")
         status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def on_mode_selected(self, event=None):
+        """模式选择事件处理"""
+        selected_mode = self.mode_var.get()
+        self.quiet_mode_frame.pack_forget()
+        self.performance_mode_frame.pack_forget()
+        self.custom_mode_frame.pack_forget()
+
+        if selected_mode == "静音模式":
+            self.quiet_mode_frame.pack(fill=tk.X, padx=5, pady=5)
+        elif selected_mode == "性能模式":
+            self.performance_mode_frame.pack(fill=tk.X, padx=5, pady=5)
+        elif selected_mode == "自定义模式":
+            self.custom_mode_frame.pack(fill=tk.X, padx=5, pady=5)
+
+    def percent_to_hex(self, percent):
+        """百分比转换为十六进制"""
+        if percent < 0 or percent > 100:
+            raise ValueError("百分比必须在0到100之间")
+        return f"0x{int(percent):02x}"
+
+    def apply_preset_mode(self, percent):
+        """应用预设模式"""
+
+        def apply_task():
+            try:
+                self.enter_manual_mode()
+                for fan_id in range(1, 8):
+                    hex_speed = self.percent_to_hex(percent)
+                    self.run_ipmitool(['raw', '0x2e', '0x30', '00', f'0{fan_id}', hex_speed])
+                self.status_var.set(f"预设模式应用成功: {percent}%")
+                messagebox.showinfo("成功", f"所有风扇已设置为{percent}%")
+            except Exception as e:
+                messagebox.showerror("错误", f"应用预设模式失败: {str(e)}")
+
+        threading.Thread(target=apply_task, daemon=True).start()
+
+    def set_single_fan(self, fan_id):
+        """设置单个风扇转速"""
+        percent = self.fan_percent_vars[fan_id].get()
+        try:
+            self.enter_manual_mode()
+            hex_speed = self.percent_to_hex(percent)
+            self.run_ipmitool(['raw', '0x2e', '0x30', '00', f'0{fan_id}', hex_speed])
+            self.status_var.set(f"风扇{fan_id}已设置为{percent}%")
+            messagebox.showinfo("成功", f"风扇{fan_id}转速已设置为{percent}%")
+        except Exception as e:
+            messagebox.showerror("错误", f"设置失败: {str(e)}")
 
     def start_update_cycle(self):
         """启动数据更新线程"""
@@ -207,6 +284,16 @@ class IPMIMonitorGUI:
                 self.bmc_ip.set(config.get('DEFAULT', 'ip', fallback=self.bmc_ip.get()))
                 self.bmc_user.set(config.get('DEFAULT', 'user', fallback=self.bmc_user.get()))
                 self.bmc_pass.set(config.get('DEFAULT', 'password', fallback=self.bmc_pass.get()))
+
+                # 模式有效性检查
+                saved_mode = config.get('DEFAULT', 'mode', fallback="静音模式")
+                if saved_mode not in ["静音模式", "性能模式", "自定义模式"]:
+                    saved_mode = "静音模式"
+                self.mode_var.set(saved_mode)
+
+                for fan_id in range(1, 8):
+                    self.fan_percent_vars[fan_id].set(
+                        config.getint('DEFAULT', f'fan_{fan_id}_percent', fallback=50))
             except Exception as e:
                 logging.error(f"配置加载失败: {str(e)}")
 
@@ -217,8 +304,11 @@ class IPMIMonitorGUI:
             'ipmitool_path': self.ipmitool_path.get(),
             'ip': self.bmc_ip.get(),
             'user': self.bmc_user.get(),
-            'password': self.bmc_pass.get()
+            'password': self.bmc_pass.get(),
+            'mode': self.mode_var.get()
         }
+        for fan_id in range(1, 8):
+            config['DEFAULT'][f'fan_{fan_id}_percent'] = str(self.fan_percent_vars[fan_id].get())
         with open('config.ini', 'w') as f:
             config.write(f)
 
@@ -283,23 +373,48 @@ class IPMIMonitorGUI:
                     pass
         return sensors
 
-    def set_fan(self):
-        """设置风扇转速"""
+    def auto_apply_custom_mode(self):
+        """开机自动应用自定义模式设置"""
+        if self.mode_var.get() == "自定义模式":
+            self.status_var.set("正在自动应用自定义模式设置...")
+            self.apply_custom_settings()
+
+    def apply_custom_settings(self):
+        """应用保存的自定义设置"""
+
+        def apply_task():
+            try:
+                self.enter_manual_mode()
+                success_count = 0
+                for fan_id in range(1, 8):
+                    percent = self.fan_percent_vars[fan_id].get()
+                    try:
+                        hex_speed = self.percent_to_hex(percent)
+                        self.run_ipmitool(['raw', '0x2e', '0x30', '00', f'0{fan_id}', hex_speed])
+                        success_count += 1
+                        logging.info(f"风扇{fan_id}设置成功: {percent}%")
+                    except Exception as e:
+                        logging.error(f"风扇{fan_id}设置失败: {str(e)}")
+
+                self.status_var.set(f"自定义模式设置应用完成，成功设置{success_count}/7个风扇")
+                if success_count < 7:
+                    messagebox.showwarning("部分成功",
+                                           f"成功设置{success_count}个风扇，请检查未设置成功的风扇连接")
+
+            except Exception as e:
+                logging.error(f"自动应用设置失败: {str(e)}")
+                messagebox.showerror("自动应用失败",
+                                     f"无法自动应用自定义设置:\n{str(e)}")
+
+        # 在独立线程中执行设置操作
+        threading.Thread(target=apply_task, daemon=True).start()
+
+    def enter_manual_mode(self):
+        """进入手动控制模式"""
         try:
-            fan_id = self.fan_id_entry.get().strip()
-            speed = self.speed_entry.get().strip()
-
-            # 输入验证
-            if not fan_id.isdigit() or int(fan_id) not in range(1, 8):
-                raise ValueError("风扇编号必须为1-7的数字")
-            if not re.match(r'^0x[0-9a-fA-F]{1,2}$', speed):
-                raise ValueError("转速格式应为十六进制 (例如0x10)")
-
-            # 执行命令
-            self.run_ipmitool(['raw', '0x2e', '0x30', '00', f'0{fan_id}', speed])
-            messagebox.showinfo("成功", "转速设置指令已发送")
+            self.run_ipmitool(['raw', '0x30', '0x30', '0x01', '0x00'])
         except Exception as e:
-            messagebox.showerror("错误", f"设置失败:\n{str(e)}")
+            logging.warning(f"进入手动模式失败: {str(e)}")
 
 
 if __name__ == "__main__":
