@@ -21,24 +21,37 @@ logging.basicConfig(
 class IPMIMonitorGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("IPMI硬件监控工具 v3.1")
+        self.root.title("联想服务器IPMI硬件监控工具 v4.2")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # 初始化参数
         self.data_queue = Queue()
-        self.update_interval = 5000  # 5秒更新间隔
+        self.update_interval = 5000
         self.running = True
         self.ipmitool_path = tk.StringVar()
         self.bmc_ip = tk.StringVar(value="192.168.8.181")
         self.bmc_user = tk.StringVar(value="albert")
         self.bmc_pass = tk.StringVar(value="admin")
         self.fan_percent_vars = {i: tk.IntVar(value=50) for i in range(1, 8)}
+        self.temp_settings = {
+            'min_temp': tk.IntVar(value=52),
+            'max_temp': tk.IntVar(value=70),
+            'min_speed': tk.IntVar(value=14),
+            'max_speed': tk.IntVar(value=100)
+        }
+        self.auto_mode_var = tk.BooleanVar(value=False)
+        self.last_protection_time = None
+        self.original_settings = {
+            'mode': None,
+            'speeds': {i: 0 for i in range(1, 8)},
+            'protection_active': False
+        }
 
-        # 初始化界面
+        # 界面初始化
         self.create_widgets()
         self.load_config()
         self.start_update_cycle()
-        self.root.after(100, self.auto_apply_custom_mode)  # 添加自动应用功能
+        self.root.after(100, self.auto_apply_custom_mode)
 
     def create_widgets(self):
         """创建界面组件"""
@@ -68,10 +81,9 @@ class IPMIMonitorGUI:
         sensor_frame = ttk.LabelFrame(main_frame, text="传感器数据")
         sensor_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # 温度监控分组
+        # 温度监控
         temp_group = ttk.LabelFrame(sensor_frame, text="温度监控")
         temp_group.pack(fill=tk.X, padx=5, pady=2)
-
         self.temp_labels = {
             'CPU1_Temp': ttk.Label(temp_group, text="CPU1温度: --"),
             'CPU2_Temp': ttk.Label(temp_group, text="CPU2温度: --"),
@@ -80,10 +92,9 @@ class IPMIMonitorGUI:
         for label in self.temp_labels.values():
             label.pack(anchor=tk.W, padx=5, pady=2)
 
-        # 电源功率分组
+        # 电源监控
         psu_group = ttk.LabelFrame(sensor_frame, text="电源监控")
         psu_group.pack(fill=tk.X, padx=5, pady=2)
-
         self.psu_labels = {
             'PSU1_POUT': ttk.Label(psu_group, text="电源1功率: --"),
             'PSU2_POUT': ttk.Label(psu_group, text="电源2功率: --")
@@ -91,10 +102,9 @@ class IPMIMonitorGUI:
         for label in self.psu_labels.values():
             label.pack(anchor=tk.W, padx=5, pady=2)
 
-        # 电压监控分组
+        # 电压监控
         voltage_group = ttk.LabelFrame(sensor_frame, text="电压监控")
         voltage_group.pack(fill=tk.X, padx=5, pady=2)
-
         self.voltage_labels = {
             'P3V3': ttk.Label(voltage_group, text="3.3V电压: --"),
             'P5V': ttk.Label(voltage_group, text="5V电压: --"),
@@ -106,7 +116,7 @@ class IPMIMonitorGUI:
         for label in self.voltage_labels.values():
             label.pack(anchor=tk.W, padx=5, pady=2)
 
-        # 风扇转速面板
+        # 风扇转速
         fan_group = ttk.LabelFrame(sensor_frame, text="风扇转速 (RPM)")
         fan_group.pack(fill=tk.X, padx=5, pady=5)
         self.fan_labels = {}
@@ -120,27 +130,28 @@ class IPMIMonitorGUI:
 
         # 模式选择
         self.mode_var = tk.StringVar()
-        modes = ["静音模式", "性能模式", "自定义模式"]
+        modes = ["静音模式", "性能模式", "自定义模式", "智能模式"]
         mode_combobox = ttk.Combobox(control_frame, textvariable=self.mode_var, values=modes, state="readonly")
         mode_combobox.pack(pady=5)
         mode_combobox.bind("<<ComboboxSelected>>", self.on_mode_selected)
         self.mode_var.set("静音模式")
 
-        # 创建不同模式的Frame
+        # 模式内容框架
         self.quiet_mode_frame = ttk.Frame(control_frame)
         self.performance_mode_frame = ttk.Frame(control_frame)
         self.custom_mode_frame = ttk.Frame(control_frame)
+        self.smart_mode_frame = ttk.Frame(control_frame)
 
-        # 静音模式内容
+        # 静音模式
         ttk.Label(self.quiet_mode_frame, text="设置所有风扇为静音转速（30%）").pack(pady=5)
         ttk.Button(self.quiet_mode_frame, text="应用静音模式", command=lambda: self.apply_preset_mode(30)).pack(pady=5)
 
-        # 性能模式内容
+        # 性能模式
         ttk.Label(self.performance_mode_frame, text="设置所有风扇为高性能转速（80%）").pack(pady=5)
         ttk.Button(self.performance_mode_frame, text="应用性能模式", command=lambda: self.apply_preset_mode(80)).pack(
             pady=5)
 
-        # 自定义模式内容
+        # 自定义模式
         for fan_id in range(1, 8):
             frame = ttk.Frame(self.custom_mode_frame)
             frame.pack(fill=tk.X, padx=5, pady=2)
@@ -149,7 +160,24 @@ class IPMIMonitorGUI:
             spinbox.pack(side=tk.LEFT, padx=5)
             ttk.Button(frame, text="设置", command=lambda fid=fan_id: self.set_single_fan(fid)).pack(side=tk.LEFT)
 
-        # 初始显示静音模式
+        # 智能模式
+        temp_control_frame = ttk.Frame(self.smart_mode_frame)
+        temp_control_frame.pack(pady=5)
+        ttk.Label(temp_control_frame, text="最低温度(℃):").grid(row=0, column=0)
+        ttk.Spinbox(temp_control_frame, from_=30, to=60, textvariable=self.temp_settings['min_temp'], width=5).grid(
+            row=0, column=1)
+        ttk.Label(temp_control_frame, text="最高温度(℃):").grid(row=1, column=0)
+        ttk.Spinbox(temp_control_frame, from_=60, to=90, textvariable=self.temp_settings['max_temp'], width=5).grid(
+            row=1, column=1)
+        ttk.Label(temp_control_frame, text="最低转速(%):").grid(row=2, column=0)
+        ttk.Spinbox(temp_control_frame, from_=20, to=50, textvariable=self.temp_settings['min_speed'], width=5).grid(
+            row=2, column=1)
+        ttk.Label(temp_control_frame, text="最高转速(%):").grid(row=3, column=0)
+        ttk.Spinbox(temp_control_frame, from_=50, to=100, textvariable=self.temp_settings['max_speed'], width=5).grid(
+            row=3, column=1)
+        self.auto_status_var = tk.StringVar(value="温控状态: 未启用")
+        ttk.Label(self.smart_mode_frame, textvariable=self.auto_status_var).pack(pady=5)
+
         self.quiet_mode_frame.pack(fill=tk.X, padx=5, pady=5)
 
         # 状态栏
@@ -163,13 +191,20 @@ class IPMIMonitorGUI:
         self.quiet_mode_frame.pack_forget()
         self.performance_mode_frame.pack_forget()
         self.custom_mode_frame.pack_forget()
+        self.smart_mode_frame.pack_forget()
 
         if selected_mode == "静音模式":
+            self.auto_mode_var.set(False)
             self.quiet_mode_frame.pack(fill=tk.X, padx=5, pady=5)
         elif selected_mode == "性能模式":
+            self.auto_mode_var.set(False)
             self.performance_mode_frame.pack(fill=tk.X, padx=5, pady=5)
         elif selected_mode == "自定义模式":
+            self.auto_mode_var.set(False)
             self.custom_mode_frame.pack(fill=tk.X, padx=5, pady=5)
+        elif selected_mode == "智能模式":
+            self.auto_mode_var.set(True)
+            self.smart_mode_frame.pack(fill=tk.X, padx=5, pady=5)
 
     def percent_to_hex(self, percent):
         """百分比转换为十六进制"""
@@ -264,6 +299,12 @@ class IPMIMonitorGUI:
             value = sensors.get(fan_key, 'N/A')
             self.fan_labels[f'FAN{i}'].config(text=f"风扇 {i}: {value} RPM" if value != 'N/A' else f"风扇 {i}: --")
 
+        # 自动温度控制
+        if self.auto_mode_var.get():
+            self.auto_fan_control(sensors)
+
+        if not self.auto_mode_var.get():
+            self.check_temp_protection(sensors)
     def browse_ipmitool(self):
         """选择ipmitool路径"""
         path = filedialog.askopenfilename(
@@ -287,13 +328,21 @@ class IPMIMonitorGUI:
 
                 # 模式有效性检查
                 saved_mode = config.get('DEFAULT', 'mode', fallback="静音模式")
-                if saved_mode not in ["静音模式", "性能模式", "自定义模式"]:
+                if saved_mode not in ["静音模式", "性能模式", "自定义模式", "智能模式"]:
                     saved_mode = "静音模式"
                 self.mode_var.set(saved_mode)
 
                 for fan_id in range(1, 8):
                     self.fan_percent_vars[fan_id].set(
                         config.getint('DEFAULT', f'fan_{fan_id}_percent', fallback=50))
+
+                # 加载温度控制设置
+                self.temp_settings['min_temp'].set(config.getint('DEFAULT', 'min_temp', fallback=40))
+                self.temp_settings['max_temp'].set(config.getint('DEFAULT', 'max_temp', fallback=70))
+                self.temp_settings['min_speed'].set(config.getint('DEFAULT', 'min_speed', fallback=30))
+                self.temp_settings['max_speed'].set(config.getint('DEFAULT', 'max_speed', fallback=100))
+                self.auto_mode_var.set(config.getboolean('DEFAULT', 'auto_mode', fallback=False))
+
             except Exception as e:
                 logging.error(f"配置加载失败: {str(e)}")
 
@@ -309,6 +358,14 @@ class IPMIMonitorGUI:
         }
         for fan_id in range(1, 8):
             config['DEFAULT'][f'fan_{fan_id}_percent'] = str(self.fan_percent_vars[fan_id].get())
+
+        # 保存温度控制设置
+        config['DEFAULT']['min_temp'] = str(self.temp_settings['min_temp'].get())
+        config['DEFAULT']['max_temp'] = str(self.temp_settings['max_temp'].get())
+        config['DEFAULT']['min_speed'] = str(self.temp_settings['min_speed'].get())
+        config['DEFAULT']['max_speed'] = str(self.temp_settings['max_speed'].get())
+        config['DEFAULT']['auto_mode'] = str(self.auto_mode_var.get())
+
         with open('config.ini', 'w') as f:
             config.write(f)
 
@@ -415,6 +472,232 @@ class IPMIMonitorGUI:
             self.run_ipmitool(['raw', '0x30', '0x30', '0x01', '0x00'])
         except Exception as e:
             logging.warning(f"进入手动模式失败: {str(e)}")
+
+    def calculate_fan_speed(self, current_temp):
+        """根据温度计算风扇转速百分比"""
+        min_temp = self.temp_settings['min_temp'].get()
+        max_temp = self.temp_settings['max_temp'].get()
+        min_speed = self.temp_settings['min_speed'].get()
+        max_speed = self.temp_settings['max_speed'].get()
+
+        if current_temp <= min_temp:
+            return min_speed
+        elif current_temp >= max_temp:
+            return max_speed
+        else:
+            # 线性计算转速百分比
+            temp_range = max_temp - min_temp
+            speed_range = max_speed - min_speed
+            return min_speed + ((current_temp - min_temp) / temp_range) * speed_range
+
+    def auto_fan_control(self, sensors):
+        """自动风扇控制逻辑"""
+        try:
+            cpu_temps = []
+            for key in ['CPU1_Temp', 'CPU2_Temp']:
+                if key in sensors and sensors[key] != 'N/A':
+                    cpu_temps.append(float(sensors[key]))
+            if not cpu_temps:
+                logging.warning("无法获取有效CPU温度数据")
+                return
+            current_temp = max(cpu_temps)
+        except (ValueError, TypeError) as e:
+            logging.error(f"温度数据解析失败: {str(e)}")
+            return
+
+        target_speed = self.calculate_fan_speed(current_temp)
+        self.auto_status_var.set(f"温控状态: {current_temp:.1f}℃ → {target_speed:.0f}%")
+
+        # 应用转速设置
+        try:
+            self.enter_manual_mode()
+            for fan_id in range(1, 8):
+                hex_speed = self.percent_to_hex(target_speed)
+                self.run_ipmitool(['raw', '0x2e', '0x30', '00', f'0{fan_id}', hex_speed])
+        except Exception as e:
+            logging.error(f"自动调速失败: {str(e)}")
+
+    def check_temp_protection(self, sensors):
+        """温度保护检查"""
+        try:
+            cpu_temps = []
+            for key in ['CPU1_Temp', 'CPU2_Temp']:
+                if key in sensors and sensors[key] != 'N/A':
+                    cpu_temps.append(float(sensors[key]))
+            if not cpu_temps:
+                return
+
+            current_temp = max(cpu_temps)
+            if current_temp > 70:
+                self.activate_temp_protection(current_temp)
+        except Exception as e:
+            logging.error(f"温度保护检测失败: {str(e)}")
+
+    def apply_preset_mode(self, percent):
+        """应用预设模式"""
+
+        def apply_task():
+            try:
+                self.enter_manual_mode()
+                for fan_id in range(1, 8):
+                    hex_speed = self.percent_to_hex(percent)
+                    self.run_ipmitool(['raw', '0x2e', '0x30', '00', f'0{fan_id}', hex_speed])
+                self.status_var.set(f"预设模式应用成功: {percent}%")
+                messagebox.showinfo("成功", f"所有风扇已设置为{percent}%")
+            except Exception as e:
+                messagebox.showerror("错误", f"应用预设模式失败: {str(e)}")
+
+        threading.Thread(target=apply_task, daemon=True).start()
+
+    def set_single_fan(self, fan_id):
+        """设置单个风扇转速"""
+        percent = self.fan_percent_vars[fan_id].get()
+        try:
+            self.enter_manual_mode()
+            hex_speed = self.percent_to_hex(percent)
+            self.run_ipmitool(['raw', '0x2e', '0x30', '00', f'0{fan_id}', hex_speed])
+            self.status_var.set(f"风扇{fan_id}已设置为{percent}%")
+            messagebox.showinfo("成功", f"风扇{fan_id}转速已设置为{percent}%")
+        except Exception as e:
+            messagebox.showerror("错误", f"设置失败: {str(e)}")
+
+    def start_update_cycle(self):
+        """启动数据更新线程"""
+        self.update_thread = threading.Thread(target=self.update_worker, daemon=True)
+        self.update_thread.start()
+        self.root.after(100, self.process_queue)
+
+    def update_worker(self):
+        """后台数据获取线程"""
+        while self.running:
+            try:
+                output = self.run_ipmitool(['sensor', 'list'])
+                sensors = self.parse_sensor_data(output)
+                self.data_queue.put(sensors)
+                self.status_var.set(f"最后更新: {datetime.now().strftime('%H:%M:%S')}")
+            except Exception as e:
+                self.data_queue.put(e)
+            finally:
+                threading.Event().wait(self.update_interval / 1000)
+
+    def process_queue(self):
+        """处理数据队列（主线程）"""
+        try:
+            while not self.data_queue.empty():
+                item = self.data_queue.get_nowait()
+                if isinstance(item, Exception):
+                    self.status_var.set(f"错误: {str(item)}")
+                    logging.error(str(item))
+                else:
+                    self.update_ui(item)
+        finally:
+            if self.running:
+                self.root.after(100, self.process_queue)
+
+    def update_ui(self, sensors):
+        """更新界面数据"""
+        # 更新温度
+        for name, label in self.temp_labels.items():
+            value = sensors.get(name, 'N/A')
+            label.config(
+                text=f"{label.cget('text').split(':')[0]}: {value}℃" if value != 'N/A' else f"{label.cget('text').split(':')[0]}: --")
+
+        # 更新电源功率
+        for name, label in self.psu_labels.items():
+            value = sensors.get(name, 'N/A')
+            label.config(
+                text=f"{label.cget('text').split(':')[0]}: {value}W" if value != 'N/A' else f"{label.cget('text').split(':')[0]}: --")
+
+        # 更新电压
+        for name, label in self.voltage_labels.items():
+            value = sensors.get(name, 'N/A')
+            formatted_value = f"{float(value):.3f} V" if value != 'N/A' else '--'
+            label.config(text=f"{label.cget('text').split(':')[0]}: {formatted_value}")
+
+        # 更新风扇转速
+        for i in range(1, 8):
+            fan_key = f'FAN{i}_R_Speed'
+            value = sensors.get(fan_key, 'N/A')
+            self.fan_labels[f'FAN{i}'].config(text=f"风扇 {i}: {value} RPM" if value != 'N/A' else f"风扇 {i}: --")
+
+        # 自动温度控制
+        if self.auto_mode_var.get():
+            self.auto_fan_control(sensors)
+        else:
+            self.check_temp_protection(sensors)
+
+    def check_temp_protection(self, sensors):
+        """温度保护检查"""
+        try:
+            cpu_temps = []
+            for key in ['CPU1_Temp', 'CPU2_Temp']:
+                if key in sensors and sensors[key] != 'N/A':
+                    cpu_temps.append(float(sensors[key]))
+            if not cpu_temps:
+                return
+
+            current_temp = max(cpu_temps)
+
+            if current_temp > 70 and not self.original_settings['protection_active']:
+                self.activate_temp_protection(current_temp)
+            elif current_temp < 65 and self.original_settings['protection_active']:
+                self.restore_original_settings()
+
+        except Exception as e:
+            logging.error(f"温度保护检测失败: {str(e)}")
+
+    def activate_temp_protection(self, current_temp):
+        """激活温度保护机制"""
+        self.original_settings.update({
+            'mode': self.mode_var.get(),
+            'speeds': {i: self.fan_percent_vars[i].get() for i in range(1, 8)},
+            'protection_active': True
+        })
+
+        logging.warning(f"温度保护触发: {current_temp}℃")
+        self.status_var.set(f"温度过高({current_temp}℃)! 启用保护模式")
+
+        def apply_protection():
+            try:
+                self.enter_manual_mode()
+                for fan_id in range(1, 8):
+                    self.run_ipmitool(['raw', '0x2e', '0x30', '00', f'0{fan_id}', '0x46'])
+                    self.fan_percent_vars[fan_id].set(70)
+
+                self.mode_var.set("保护模式")
+                messagebox.showwarning("高温保护",
+                                       f"检测到CPU温度已达{current_temp}℃\n已启用风扇保护模式")
+
+            except Exception as e:
+                logging.error(f"温度保护执行失败: {str(e)}")
+
+        threading.Thread(target=apply_protection, daemon=True).start()
+
+    def restore_original_settings(self):
+        """恢复原始设置"""
+        logging.info("温度恢复正常，正在恢复原始设置")
+        self.status_var.set("正在恢复原始设置...")
+        self.original_settings['protection_active'] = False
+
+        def restore_task():
+            try:
+                self.mode_var.set(self.original_settings['mode'])
+                self.enter_manual_mode()
+                for fan_id in range(1, 8):
+                    original_speed = self.original_settings['speeds'][fan_id]
+                    hex_speed = self.percent_to_hex(original_speed)
+                    self.run_ipmitool(['raw', '0x2e', '0x30', '00', f'0{fan_id}', hex_speed])
+                    self.fan_percent_vars[fan_id].set(original_speed)
+
+                self.save_config()
+                self.status_var.set("原始设置已恢复")
+                messagebox.showinfo("恢复完成", "已恢复至保护前的设置")
+
+            except Exception as e:
+                logging.error(f"设置恢复失败: {str(e)}")
+
+        threading.Thread(target=restore_task, daemon=True).start()
+
 
 
 if __name__ == "__main__":
