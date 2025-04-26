@@ -21,7 +21,7 @@ logging.basicConfig(
 class IPMIMonitorGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("联想服务器IPMI硬件监控工具 v4.2")
+        self.root.title("联想服务器IPMI硬件监控工具 v4.2 by hmr")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # 初始化参数
