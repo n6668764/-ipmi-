@@ -1,0 +1,631 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import subprocess
+import re
+import configparser
+import os
+import logging
+import threading
+from datetime import datetime
+from queue import Queue
+
+# 配置日志系统
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='ipmi_monitor.log',
+    filemode='w'
+)
+
+
+class UnifiedIPMIMonitor:
+    def __init__(self, root):
+        self.server_type = tk.StringVar(value="SR665")
+        self.root = root
+        self.root.title("统一服务器IPMI监控工具 v6.3 by hmr")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # 初始化参数
+        self.server_type = tk.StringVar()
+        self.data_queue = Queue()
+        self.update_interval = 3000
+        self.running = True
+        self.protection_active = False
+        self.fan_percent_vars = {}
+        self.mode_var = tk.StringVar()
+        self.temp_settings = {
+            'min_temp': tk.IntVar(value=45),
+            'max_temp': tk.IntVar(value=75),
+            'min_speed': tk.IntVar(value=30),
+            'max_speed': tk.IntVar(value=100)
+        }
+
+        # 通用配置参数
+        self.ipmitool_path = tk.StringVar()
+        self.bmc_ip = tk.StringVar()
+        self.bmc_user = tk.StringVar()
+        self.bmc_pass = tk.StringVar()
+
+        # 服务器参数配置
+        self.server_params = {
+            "HR650X": {
+                "fan_count": 6,
+                "temp_sensors": ["CPU1_Temp", "CPU2_Temp", "PCH_Temp"],
+                "psu_sensors": ["PSU1_POUT", "PSU2_POUT"],
+                "voltage_sensors": ["P3V3", "P5V", "P12V", "Vbat", "CPU1_VCCIN", "CPU2_VCCIN"]
+            },
+            "SR665": {
+                "fan_count": 6,
+                "temp_sensors": ["CPU1_Temp", "CPU2_Temp", "Ambient_Temp", "Exhaust_Temp"],
+                "psu_sensors": ["PSU1_POUT", "PSU2_POUT"],
+                "voltage_sensors": []
+            }
+        }
+
+        # 初始化界面
+        self.create_widgets()
+        self.load_config()  # 先加载配置
+        self.init_server_specific_ui()  # 再初始化界面
+        self.start_update_cycle()
+
+    def create_widgets(self):
+        """创建通用界面组件"""
+        tool_frame = ttk.Frame(self.root)
+        tool_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        # 服务器选择
+        ttk.Label(tool_frame, text="服务器型号:").grid(row=0, column=0, padx=2)
+        self.server_combo = ttk.Combobox(tool_frame, textvariable=self.server_type,
+                                         values=["HR650X", "SR665"], state="readonly")
+        self.server_combo.grid(row=0, column=1, padx=2)
+        self.server_combo.bind("<<ComboboxSelected>>", self.on_server_changed)
+
+        # 工具路径组件
+        ttk.Label(tool_frame, text="工具路径:").grid(row=0, column=2, padx=2)
+        ttk.Entry(tool_frame, textvariable=self.ipmitool_path, width=30).grid(row=0, column=3, padx=2)
+        ttk.Button(tool_frame, text="浏览", command=self.browse_ipmitool).grid(row=0, column=4, padx=2)
+
+        # 连接参数组件
+        ttk.Label(tool_frame, text="BMC IP:").grid(row=1, column=0, padx=2)
+        ttk.Entry(tool_frame, textvariable=self.bmc_ip, width=15).grid(row=1, column=1, padx=2)
+        ttk.Label(tool_frame, text="用户名:").grid(row=1, column=2, padx=2)
+        ttk.Entry(tool_frame, textvariable=self.bmc_user, width=10).grid(row=1, column=3, padx=2)
+        ttk.Label(tool_frame, text="密码:").grid(row=1, column=4, padx=2)
+        ttk.Entry(tool_frame, textvariable=self.bmc_pass, show="*", width=10).grid(row=1, column=5, padx=2)
+        ttk.Button(tool_frame, text="测试连接", command=self.test_connection).grid(row=1, column=6, padx=5)
+
+        self.main_frame = ttk.Frame(self.root)
+        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        self.status_var = tk.StringVar(value="就绪")
+        self.status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def init_server_specific_ui(self):
+        """初始化服务器特定UI组件"""
+        # 清除旧组件
+        for widget in self.main_frame.winfo_children():
+            widget.destroy()
+
+        # 传感器面板
+        self.sensor_frame = ttk.LabelFrame(self.main_frame, text="传感器数据")
+        self.sensor_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # 控制面板
+        self.control_frame = ttk.LabelFrame(self.main_frame, text="风扇控制")
+        self.control_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5)
+
+        # 创建子组件
+        self.create_sensor_panels()
+        self.create_control_panels()
+
+    def create_sensor_panels(self):
+        """创建传感器数据显示面板"""
+        # 温度监控
+        temp_group = ttk.LabelFrame(self.sensor_frame, text="温度监控")
+        temp_group.pack(fill=tk.X, padx=5, pady=2)
+        self.temp_labels = {}
+        for sensor in self.server_params[self.server_type.get()]["temp_sensors"]:
+            self.temp_labels[sensor] = ttk.Label(temp_group, text=f"{sensor.replace('_', ' ')}: --")
+            self.temp_labels[sensor].pack(anchor=tk.W, padx=5, pady=2)
+
+        # 电源监控
+        psu_group = ttk.LabelFrame(self.sensor_frame, text="电源监控")
+        psu_group.pack(fill=tk.X, padx=5, pady=2)
+        self.psu_labels = {}
+        for sensor in self.server_params[self.server_type.get()]["psu_sensors"]:
+            self.psu_labels[sensor] = ttk.Label(psu_group, text=f"{sensor.replace('_', ' ')}: --")
+            self.psu_labels[sensor].pack(anchor=tk.W, padx=5, pady=2)
+
+        # 电压监控（仅HR650X）
+        if self.server_type.get() == "HR650X":
+            voltage_group = ttk.LabelFrame(self.sensor_frame, text="电压监控")
+            voltage_group.pack(fill=tk.X, padx=5, pady=2)
+            self.voltage_labels = {}
+            for sensor in self.server_params[self.server_type.get()]["voltage_sensors"]:
+                self.voltage_labels[sensor] = ttk.Label(voltage_group, text=f"{sensor.replace('_', ' ')}: --")
+                self.voltage_labels[sensor].pack(anchor=tk.W, padx=5, pady=2)
+
+        # 风扇转速
+        fan_group = ttk.LabelFrame(self.sensor_frame, text="风扇转速 (RPM)")
+        fan_group.pack(fill=tk.X, padx=5, pady=5)
+        self.fan_labels = {}
+        fan_count = self.server_params[self.server_type.get()]["fan_count"]
+        for i in range(1, fan_count + 1):
+            label = ttk.Label(fan_group, text=f"风扇 {i}: --")
+            row = (i - 1) // 3
+            col = (i - 1) % 3
+            label.grid(row=row, column=col, padx=5, pady=2, sticky=tk.W)
+            self.fan_labels[f'FAN{i}'] = label
+
+    def create_control_panels(self):
+        """创建控制面板"""
+        # 模式选择
+        modes = ["静音模式", "性能模式", "手动模式", "智能模式"]
+        mode_combobox = ttk.Combobox(self.control_frame, textvariable=self.mode_var,
+                                     values=modes, state="readonly")
+        mode_combobox.pack(pady=5)
+        mode_combobox.bind("<<ComboboxSelected>>", self.on_mode_selected)
+
+        # 模式框架
+        self.mode_frames = {
+            "静音模式": ttk.Frame(self.control_frame),
+            "性能模式": ttk.Frame(self.control_frame),
+            "手动模式": ttk.Frame(self.control_frame),
+            "智能模式": ttk.Frame(self.control_frame)
+        }
+
+        # 静音模式
+        ttk.Label(self.mode_frames["静音模式"], text="设置所有风扇为静音转速（20%）").pack(pady=5)
+        ttk.Button(self.mode_frames["静音模式"], text="应用静音模式", command=lambda: self.apply_preset_mode(20)).pack(
+            pady=5)
+
+        # 性能模式
+        ttk.Label(self.mode_frames["性能模式"], text="设置所有风扇为高性能转速（80%）").pack(pady=5)
+        ttk.Button(self.mode_frames["性能模式"], text="应用性能模式", command=lambda: self.apply_preset_mode(80)).pack(
+            pady=5)
+
+        # 手动模式
+        self.create_manual_controls()
+
+        # 智能模式
+        self.create_smart_controls()
+
+        # 确认按钮
+        ttk.Button(self.control_frame, text="确认应用", command=self.apply_settings).pack(pady=10)
+
+    def create_manual_controls(self):
+        """创建手动控制组件"""
+        frame = self.mode_frames["手动模式"]
+        ttk.Label(frame, text="手动控制风扇转速 (%)", font=('Arial', 10, 'bold')).pack(pady=5)
+
+        # 双列布局
+        columns = ttk.Frame(frame)
+        columns.pack(fill=tk.BOTH, expand=True)
+
+        left_col = ttk.Frame(columns)
+        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10)
+        right_col = ttk.Frame(columns)
+        right_col.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10)
+
+        # 初始化风扇控制条
+        self.fan_percent_vars = {}
+        fan_count = self.server_params[self.server_type.get()]["fan_count"]
+        for fan_id in range(1, fan_count + 1):
+            parent = left_col if fan_id <= (fan_count // 2) else right_col
+            fan_frame = ttk.Frame(parent)
+            fan_frame.pack(fill=tk.X, padx=5, pady=2)
+
+            self.fan_percent_vars[fan_id] = tk.IntVar(value=40)
+
+            ttk.Label(fan_frame, text=f"风扇 {fan_id}:").pack(side=tk.LEFT)
+            ttk.Scale(fan_frame, from_=5, to=100, variable=self.fan_percent_vars[fan_id],
+                      orient=tk.HORIZONTAL, length=150).pack(side=tk.LEFT, padx=5)
+            ttk.Label(fan_frame, textvariable=self.fan_percent_vars[fan_id], width=3).pack(side=tk.LEFT)
+
+    def create_smart_controls(self):
+        """创建智能控制组件"""
+        frame = self.mode_frames["智能模式"]
+        control_frame = ttk.Frame(frame)
+        control_frame.pack(pady=5)
+
+        # 温度设置
+        ttk.Label(control_frame, text="最低温度(℃):").grid(row=0, column=0)
+        ttk.Spinbox(control_frame, from_=30, to=60, textvariable=self.temp_settings['min_temp'], width=5).grid(row=0,
+                                                                                                               column=1)
+        ttk.Label(control_frame, text="最高温度(℃):").grid(row=1, column=0)
+        ttk.Spinbox(control_frame, from_=60, to=90, textvariable=self.temp_settings['max_temp'], width=5).grid(row=1,
+                                                                                                               column=1)
+        ttk.Label(control_frame, text="最低转速(%):").grid(row=2, column=0)
+        ttk.Spinbox(control_frame, from_=5, to=50, textvariable=self.temp_settings['min_speed'], width=5).grid(row=2,
+                                                                                                                column=1)
+        ttk.Label(control_frame, text="最高转速(%):").grid(row=3, column=0)
+        ttk.Spinbox(control_frame, from_=50, to=100, textvariable=self.temp_settings['max_speed'], width=5).grid(row=3,
+                                                                                                                 column=1)
+
+        # 状态显示
+        self.auto_status_var = tk.StringVar(value="温控状态: 未启用")
+        ttk.Label(frame, textvariable=self.auto_status_var).pack(pady=5)
+
+    def on_server_changed(self, event=None):
+        """服务器类型变更处理"""
+        self.save_config()  # 立即保存当前配置
+        self.init_server_specific_ui()
+        self.load_config()
+        self.update_status(f"已切换到 {self.server_type.get()} 配置")
+
+    def apply_settings(self):
+        """应用当前设置"""
+        mode = self.mode_var.get()
+        if mode == "静音模式":
+            self.apply_preset_mode(20)
+        elif mode == "性能模式":
+            self.apply_preset_mode(80)
+        elif mode == "手动模式":
+            self.apply_manual_mode()
+        elif mode == "智能模式":
+            self.update_status("智能模式已启用")
+
+    def apply_preset_mode(self, percent):
+        """应用预设模式"""
+        try:
+            if self.server_type.get() == "HR650X":
+                self.hr650x_set_all_fans(percent)
+            else:
+                self.sr665_set_all_fans(percent)
+            self.update_status(f"所有风扇已设置为{percent}%")
+        except Exception as e:
+            self.update_status(f"应用失败: {str(e)}", "error")
+
+    def apply_manual_mode(self):
+        """应用手动设置"""
+        try:
+            fan_count = self.server_params[self.server_type.get()]["fan_count"]
+            for fan_id in range(1, fan_count + 1):
+                percent = self.fan_percent_vars[fan_id].get()
+                if self.server_type.get() == "HR650X":
+                    self.hr650x_set_single_fan(fan_id, percent)
+                else:
+                    self.sr665_set_single_fan(fan_id, percent)
+            self.update_status("手动设置已应用")
+        except Exception as e:
+            self.update_status(f"手动设置失败: {str(e)}", "error")
+
+    def hr650x_set_all_fans(self, percent):
+        """设置HR650X所有风扇"""
+        hex_speed = f"0x{int(percent):02x}"
+        for fan_id in range(1, 7):
+            self.run_ipmitool(['raw', '0x2e', '0x30', '00', f'0{fan_id}', hex_speed])
+
+    def sr665_set_all_fans(self, percent):
+        """设置SR665所有风扇"""
+        self.run_ipmitool(['raw', '0x3a', '0x07', '0xff', str(percent), '0x01'])
+
+    def hr650x_set_single_fan(self, fan_id, percent):
+        """设置HR650X单个风扇"""
+        hex_speed = f"0x{int(percent):02x}"
+        self.run_ipmitool(['raw', '0x2e', '0x30', '00', f'0{fan_id}', hex_speed])
+
+    def sr665_set_single_fan(self, fan_id, percent):
+        """设置SR665单个风扇"""
+        self.run_ipmitool(['raw', '0x3a', '0x07', f'0x{fan_id:02x}', str(percent), '0x01'])
+
+    def run_ipmitool(self, command):
+        """执行IPMI命令"""
+        if not os.path.exists(self.ipmitool_path.get()):
+            raise FileNotFoundError(f"找不到ipmitool: {self.ipmitool_path.get()}")
+
+        cmd = [
+                  self.ipmitool_path.get(),
+                  '-I', 'lanplus',
+                  '-H', self.bmc_ip.get(),
+                  '-U', self.bmc_user.get(),
+                  '-P', self.bmc_pass.get()
+              ] + command
+
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=15,
+                check=True
+            )
+            return result.stdout
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"IPMI错误: {e.stderr}")
+        except Exception as e:
+            raise RuntimeError(f"执行异常: {str(e)}")
+
+    def start_update_cycle(self):
+        """启动数据更新线程"""
+        self.update_thread = threading.Thread(target=self.update_worker, daemon=True)
+        self.update_thread.start()
+        self.root.after(100, self.process_queue)
+
+    def update_worker(self):
+        """数据更新线程"""
+        while self.running:
+            try:
+                output = self.run_ipmitool(['sensor', 'list'])
+                sensors = self.parse_sensor_data(output)
+                self.data_queue.put(sensors)
+                self.update_status(f"最后更新: {datetime.now().strftime('%H:%M:%S')}")
+            except Exception as e:
+                self.data_queue.put(e)
+            finally:
+                threading.Event().wait(self.update_interval / 1000)
+
+    def parse_sensor_data(self, output):
+        """解析传感器数据"""
+        sensors = {}
+        pattern = re.compile(
+            r"^(?P<name>.+?)\s*\|\s*"
+            r"(?P<value>-?\d+\.?\d*)\s+\|"
+            r"\s+(?P<unit>degrees C|RPM|Watts|Volts|CFM)"
+        )
+
+        for line in output.splitlines():
+            match = pattern.search(line)
+            if not match:
+                continue
+
+            sensor_data = match.groupdict()
+            key = sensor_data['name'].replace(" ", "_").replace("_Tach", "_R_Speed")
+            sensors[key] = sensor_data['value']
+
+        return sensors
+
+    def process_queue(self):
+        """处理数据队列"""
+        try:
+            while not self.data_queue.empty():
+                item = self.data_queue.get_nowait()
+                if isinstance(item, Exception):
+                    self.update_status(f"数据更新失败: {str(item)}", "error")
+                else:
+                    self.update_ui(item)
+                    self.check_temp_protection(item)
+                    if self.mode_var.get() == "智能模式":
+                        self.auto_fan_control(item)
+        finally:
+            if self.running:
+                self.root.after(100, self.process_queue)
+
+    def update_ui(self, sensors):
+        """更新界面数据"""
+        # 温度
+        for name in self.server_params[self.server_type.get()]["temp_sensors"]:
+            value = sensors.get(name, 'N/A')
+            self.temp_labels[name].config(text=f"{name.replace('_', ' ')}: {value}℃")
+
+        # 电源
+        for name in self.server_params[self.server_type.get()]["psu_sensors"]:
+            value = sensors.get(name, 'N/A')
+            self.psu_labels[name].config(text=f"{name.replace('_', ' ')}: {value}W")
+
+        # 风扇
+        fan_count = self.server_params[self.server_type.get()]["fan_count"]
+        for i in range(1, fan_count + 1):
+            value = sensors.get(f'FAN{i}_R_Speed', 'N/A')
+            self.fan_labels[f'FAN{i}'].config(text=f"风扇 {i}: {value} RPM")
+
+    def auto_fan_control(self, sensors):
+        """智能风扇控制"""
+        try:
+            temps = [float(sensors.get(t, 0)) for t in self.server_params[self.server_type.get()]["temp_sensors"]]
+            current_temp = max(temps)
+
+            min_temp = self.temp_settings['min_temp'].get()
+            max_temp = self.temp_settings['max_temp'].get()
+            min_speed = self.temp_settings['min_speed'].get()
+            max_speed = self.temp_settings['max_speed'].get()
+
+            if current_temp <= min_temp:
+                target = min_speed
+            elif current_temp >= max_temp:
+                target = max_speed
+            else:
+                ratio = (current_temp - min_temp) / (max_temp - min_temp)
+                target = min_speed + (max_speed - min_speed) * ratio
+
+            self.auto_status_var.set(f"温度: {current_temp}℃ → 转速: {int(target)}%")
+            self.apply_preset_mode(int(target))
+        except Exception as e:
+            self.update_status(f"温控失败: {str(e)}", "error")
+
+    def browse_ipmitool(self):
+        """选择ipmitool路径"""
+        path = filedialog.askopenfilename(
+            title="选择ipmitool可执行文件",
+            filetypes=[("可执行文件", "*.exe"), ("所有文件", "*.*")]
+        )
+        if path:
+            self.ipmitool_path.set(path)
+            self.save_config()
+
+    def save_config(self):
+        """保存配置"""
+        config = configparser.ConfigParser()
+        config['DEFAULT'] = {
+            'server_type': self.server_type.get(),
+            'ipmitool_path': self.ipmitool_path.get(),
+            'bmc_ip': self.bmc_ip.get(),
+            'bmc_user': self.bmc_user.get(),
+            'bmc_pass': self.bmc_pass.get(),
+            'mode': self.mode_var.get(),
+            'min_temp': self.temp_settings['min_temp'].get(),
+            'max_temp': self.temp_settings['max_temp'].get(),
+            'min_speed': self.temp_settings['min_speed'].get(),
+            'max_speed': self.temp_settings['max_speed'].get()
+        }
+
+        # 保存风扇设置
+        fan_count = self.server_params[self.server_type.get()]["fan_count"]
+        for fan_id in range(1, fan_count + 1):
+            config['DEFAULT'][f'fan_{fan_id}'] = str(self.fan_percent_vars[fan_id].get())
+
+        with open('config.ini', 'w') as f:
+            config.write(f)
+        self.update_status("配置已保存")
+
+    def load_config(self):
+        """加载配置"""
+        config = configparser.ConfigParser()
+        default_config = {
+            'server_type': 'SR665',
+            'ipmitool_path': '',
+            'bmc_ip': '192.168.8.181',
+            'bmc_user': 'albert',
+            'bmc_pass': 'admin',
+            'mode': '静音模式',
+            'min_temp': '45',
+            'max_temp': '75',
+            'min_speed': '30',
+            'max_speed': '100'
+        }
+
+        try:
+            if not os.path.exists('config.ini'):
+                self.create_default_config(default_config)
+                return
+
+            config.read('config.ini')
+
+            # 加载服务器类型
+            server_type = config.get('DEFAULT', 'server_type', fallback=default_config['server_type'])
+            if server_type in ["HR650X", "SR665"]:
+                self.server_type.set(server_type)
+            else:
+                raise ValueError("无效的服务器类型")
+
+            # 加载其他参数
+            self.ipmitool_path.set(config.get('DEFAULT', 'ipmitool_path', fallback=default_config['ipmitool_path']))
+            self.bmc_ip.set(config.get('DEFAULT', 'bmc_ip', fallback=default_config['bmc_ip']))
+            self.bmc_user.set(config.get('DEFAULT', 'bmc_user', fallback=default_config['bmc_user']))
+            self.bmc_pass.set(config.get('DEFAULT', 'bmc_pass', fallback=default_config['bmc_pass']))
+            self.mode_var.set(config.get('DEFAULT', 'mode', fallback=default_config['mode']))
+
+            # 加载温度设置
+            self.temp_settings['min_temp'].set(
+                config.getint('DEFAULT', 'min_temp', fallback=default_config['min_temp']))
+            self.temp_settings['max_temp'].set(
+                config.getint('DEFAULT', 'max_temp', fallback=default_config['max_temp']))
+            self.temp_settings['min_speed'].set(
+                config.getint('DEFAULT', 'min_speed', fallback=default_config['min_speed']))
+            self.temp_settings['max_speed'].set(
+                config.getint('DEFAULT', 'max_speed', fallback=default_config['max_speed']))
+
+            # 加载风扇设置
+            fan_count = self.server_params[self.server_type.get()]["fan_count"]
+            for fan_id in range(1, fan_count + 1):
+                value = config.getint('DEFAULT', f'fan_{fan_id}', fallback=40)
+                self.fan_percent_vars[fan_id].set(max(5, min(100, value)))
+
+            self.update_status("配置加载成功")
+
+        except Exception as e:
+            self.update_status(f"配置加载失败: {str(e)}", "error")
+            self.create_default_config(default_config)
+
+    def create_default_config(self, default_config):
+        """创建默认配置"""
+        config = configparser.ConfigParser()
+        config['DEFAULT'] = default_config
+
+        fan_count = self.server_params[self.server_type.get()]["fan_count"]
+        for fan_id in range(1, fan_count + 1):
+            config['DEFAULT'][f'fan_{fan_id}'] = '40'
+
+        with open('config.ini', 'w') as f:
+            config.write(f)
+        self.update_status("已创建默认配置")
+
+    def test_connection(self):
+        """测试BMC连接"""
+        try:
+            output = self.run_ipmitool(['sensor', 'list'])
+            if "Temp" in output or "RPM" in output:
+                self.update_status("BMC连接成功")
+            else:
+                self.update_status("收到无效传感器数据", "warning")
+            return True
+        except Exception as e:
+            self.update_status(f"连接失败: {str(e)}", "error")
+            return False
+
+    def on_close(self):
+        """关闭程序"""
+        self.running = False
+        self.save_config()
+        if self.update_thread.is_alive():
+            self.update_thread.join(timeout=2)
+        self.root.destroy()
+
+    def on_mode_selected(self, event=None):
+        """模式选择处理"""
+        selected_mode = self.mode_var.get()
+        for frame in self.mode_frames.values():
+            frame.pack_forget()
+        if selected_mode in self.mode_frames:
+            self.mode_frames[selected_mode].pack(fill=tk.BOTH, expand=True)
+        self.auto_status_var.set("温控状态: 运行中" if selected_mode == "智能模式" else "温控状态: 未启用")
+
+    def update_status(self, message, level="info"):
+        """更新状态栏"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        formatted_msg = f"[{timestamp}] {message}"
+
+        # 设置颜色
+        colors = {
+            "info": ("black", "white"),
+            "warning": ("orange", "white"),
+            "error": ("red", "white")
+        }
+        fg, bg = colors.get(level, ("black", "white"))
+
+        self.status_var.set(formatted_msg)
+        self.status_bar.config(foreground=fg, background=bg)
+        logging.log(getattr(logging, level.upper(), logging.INFO), message)
+
+    def check_temp_protection(self, sensors):
+        """温度保护检查"""
+        try:
+            temps = [float(sensors.get(t, 0)) for t in self.server_params[self.server_type.get()]["temp_sensors"]]
+            current_temp = max(temps)
+
+            if current_temp > 80 and not self.protection_active:
+                self.activate_temp_protection(current_temp)
+            elif current_temp < 70 and self.protection_active:
+                self.restore_normal_mode()
+        except Exception as e:
+            self.update_status(f"温度保护检测失败: {str(e)}", "error")
+
+    def activate_temp_protection(self, current_temp):
+        """激活温度保护"""
+        self.protection_active = True
+        self.update_status(f"温度过高({current_temp}℃)! 启用保护模式", "warning")
+        try:
+            if self.server_type.get() == "HR650X":
+                self.hr650x_set_all_fans(100)
+            else:
+                self.sr665_set_all_fans(100)
+        except Exception as e:
+            self.update_status(f"保护模式启动失败: {str(e)}", "error")
+
+    def restore_normal_mode(self):
+        """恢复正常模式"""
+        self.protection_active = False
+        self.update_status("温度恢复正常，恢复原始设置")
+        try:
+            self.mode_var.set("智能模式")
+            self.apply_settings()
+        except Exception as e:
+            self.update_status(f"恢复设置失败: {str(e)}", "error")
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = UnifiedIPMIMonitor(root)
+    root.mainloop()
